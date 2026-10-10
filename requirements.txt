@@ -1,0 +1,39 @@
+# vcam — real-time webcam virtual background
+# Python 3.9–3.13.  Install with:  pip install -r requirements.txt
+mediapipe>=0.10.30
+# contrib build provides cv2.ximgproc (guided filter for sharp edge refinement);
+# it is also what mediapipe depends on. Do NOT also install opencv-python — they conflict.
+opencv-contrib-python>=4.8
+pyvirtualcam>=0.11
+numpy>=1.24
+
+# RobustVideoMatting engine (best quality). Optional — without it vcam falls back
+# to MediaPipe.
+#
+# This file installs the NVIDIA (CUDA 12) build of onnxruntime, which also
+# contains the CPU provider, so the Device dropdown in vcam_ui.py (Auto / CPU /
+# GPU) works with this single package. In "Auto" mode vcam time-trials the GPU
+# at startup and only uses it if it clearly beats the CPU; on small GPUs the CPU
+# is often just as fast, so Auto may well stay on CPU.
+#
+# Install ONLY ONE onnxruntime variant. Do not install onnxruntime or
+# onnxruntime-directml alongside onnxruntime-gpu: they share one module name and
+# conflict. If you pip-installed one before, uninstall it first:
+#   pip uninstall -y onnxruntime onnxruntime-directml onnxruntime-gpu
+onnxruntime-gpu==1.20.2
+
+# CUDA 12 / cuDNN 9 runtime DLLs, installed from pip so no system CUDA Toolkit or
+# cuDNN install is needed. Pinned to 12.6 to match NVIDIA driver 560 (CUDA 12.6);
+# a newer driver (580+) can use newer 12.x builds. Do NOT use CUDA 13: it dropped
+# support for Pascal cards such as the GTX 10-series.
+# vcam.py must register the venv's site-packages\nvidia\*\bin folders with
+# os.add_dll_directory() before onnxruntime is imported (see the top of vcam.py).
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cuda-nvrtc-cu12==12.6.77
+nvidia-cublas-cu12==12.6.4.1
+nvidia-cufft-cu12==11.3.0.4
+nvidia-curand-cu12==10.3.7.77
+nvidia-cudnn-cu12==9.5.1.17
+
+# GUI control panel (vcam_ui.py): preview thumbnails. tkinter ships with Python.
+pillow>=9

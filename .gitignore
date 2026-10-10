@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Downloaded model weights (fetched automatically on first run)
+models/*.tflite
+models/*.onnx
+
+# Local backgrounds / scratch
+backgrounds/*.local.*
+*.log
+
+# Personal local files (per-user background pic, launcher script)
+/2.png
+/start.cmd
+
+# PyInstaller build output (keep vcam.spec; ignore the artifacts)
+build/
+dist/
+*.exe
+
+# Background Images
+vb/
+
