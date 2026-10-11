@@ -1,0 +1,3 @@
+PASS
+RVM OK: alpha(480, 640) fg(480, 640, 3) dsr=0.375 threads=8
+virtualcam_installed=True

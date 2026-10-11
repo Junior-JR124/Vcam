@@ -12,6 +12,7 @@ models/*.onnx
 # Local backgrounds / scratch
 backgrounds/*.local.*
 *.log
+/vb
 
 # Personal local files (per-user background pic, launcher script)
 /2.png
@@ -21,7 +22,3 @@ backgrounds/*.local.*
 build/
 dist/
 *.exe
-
-# Background Images
-vb/
-

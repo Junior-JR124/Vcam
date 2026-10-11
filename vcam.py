@@ -33,8 +33,12 @@ downloaded automatically on first run into ``models/``.
 from __future__ import annotations
 
 import os, sys, glob, site
-if sys.platform.startswith("win") and not getattr(sys, "frozen", False):
-    for _sp in site.getsitepackages():
+if sys.platform.startswith("win"):
+    # Frozen build: the CUDA DLLs sit in <app>\_internal\nvidia\*\bin.
+    # From source: they live in the venv's site-packages\nvidia\*\bin.
+    _bases = ([getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))]
+              if getattr(sys, "frozen", False) else site.getsitepackages())
+    for _sp in _bases:
         for _d in glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
             os.add_dll_directory(_d)
             os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
@@ -170,7 +174,13 @@ def resize_cover(img: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def load_background_image(path: str, width: int, height: int) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    # cv2.imread can't open non-ASCII paths on Windows; read the bytes ourselves
+    # and decode from memory instead.
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        data = None
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data is not None and data.size else None
     if img is None:
         raise RuntimeError(f"Could not read background image: {path}")
     return resize_cover(img, width, height)
@@ -475,9 +485,6 @@ class RvmEngine:
         self._dsr = np.array([self.dsr], np.float32)
         self._src = None        # reused NCHW input buffer (no per-frame realloc)
 
-        self.sess, self.provider, self.bench, self.note = _select_rvm_session(
-            ensure_rvm_model(), self.threads, width, height, device)
-
     def process(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
         # Fill a reused float32 NCHW buffer directly (avoids astype + transpose
@@ -698,6 +705,7 @@ def _keep_largest(alpha):
 
 def make_engine(args, width, height):
     """Pick the matting engine: RVM if available (best quality), else MediaPipe."""
+    fallback = ""
     want = args.engine
     if want == "auto":
         want = "rvm" if ort is not None else "mediapipe"
@@ -731,11 +739,14 @@ def make_engine(args, width, height):
                 if mp is None:
                     raise RuntimeError(f"RVM engine failed to start: {exc}") from exc
                 print(f"[vcam] RVM unavailable ({exc}) -> falling back to MediaPipe.")
+                fallback = f"RVM failed, using MediaPipe: {str(exc)[:80]}"
                 want = "mediapipe"
     if mp is None:
         raise RuntimeError("No matting engine available (onnxruntime/RVM required).")
     print("[vcam] Engine: MediaPipe selfie segmentation")
-    return MediaPipeEngine(width, height, args)
+    engine = MediaPipeEngine(width, height, args)
+    engine.note = fallback
+    return engine
 
 
 # --------------------------------------------------------------------------- #
@@ -808,6 +819,40 @@ def install_virtualcam() -> tuple[bool, str]:
 
 def uninstall_virtualcam() -> tuple[bool, str]:
     return _run_regsvr(find_virtualcam_dlls(), unregister=True)
+
+
+def disable_power_throttling() -> bool:
+    """Opt this process out of Windows power throttling (EcoQoS).
+
+    Windows 11 treats a process whose window is minimized or covered as
+    background work: it lowers its clock speed and, on hybrid CPUs (Intel 12th
+    gen+), moves its threads to the slow efficiency cores. For a live camera
+    that means the frame rate collapses the moment the window is hidden, so we
+    opt out and keep matting at full speed. No-op (False) off Windows or on
+    Windows builds without the API."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ThrottlingState(ctypes.Structure):   # PROCESS_POWER_THROTTLING_STATE
+            _fields_ = [("Version", wintypes.ULONG),
+                        ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+
+        # ControlMask = EXECUTION_SPEED with StateMask = 0 -> "never throttle me".
+        state = _ThrottlingState(1, 0x1, 0)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD]
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        return bool(k32.SetProcessInformation(k32.GetCurrentProcess(),
+                                              4,            # ProcessPowerThrottling
+                                              ctypes.byref(state), ctypes.sizeof(state)))
+    except (OSError, AttributeError):
+        return False
 
 
 class OutputPipeline:
@@ -911,6 +956,7 @@ class VCamWorker:
         self.error = None
         self.fps = 0.0
         self.device = None
+        self.bg_warning = None       # set when the image background fell back to blur
         self.cfg = dict(self.DEFAULTS)
         self.provider = None
         self.device_note = ""
@@ -972,16 +1018,22 @@ class VCamWorker:
     def _build_compositor(self, width, height):
         mode = self.cfg["mode"]
         strength = self.cfg.get("blur_strength", 1.0)
+        self.bg_warning = None
         if mode == "color":
             return Compositor(width, height, solid_color_background(self.cfg["color"], width, height), False)
-        if mode == "image" and self.cfg["bg_path"] and Path(self.cfg["bg_path"]).is_file():
-            try:
-                bg = load_background_image(self.cfg["bg_path"], width, height)
-                if self.cfg.get("blur_image"):
-                    bg = blur_background_image(bg, strength)
-                return Compositor(width, height, bg, False)
-            except RuntimeError:
-                pass   # unreadable image -> fall back to blur
+        if mode == "image" and self.cfg["bg_path"]:
+            path = self.cfg["bg_path"]
+            if not Path(path).is_file():
+                self.bg_warning = f"background image not found: {Path(path).name}"
+            else:
+                try:
+                    bg = load_background_image(path, width, height)
+                    if self.cfg.get("blur_image"):
+                        bg = blur_background_image(bg, strength)
+                    return Compositor(width, height, bg, False)
+                except RuntimeError:
+                    self.bg_warning = f"can't read background image: {Path(path).name}"
+            # missing/unreadable image -> fall back to blur (warning shown in the UI)
         # blur (and fallback when no image chosen)
         return Compositor(width, height, None, True, blur_strength=strength)
 
@@ -1085,6 +1137,7 @@ class VCamWorker:
 
 
 def run(args: argparse.Namespace) -> int:
+    disable_power_throttling()        # full speed even when the window is hidden
     cap = open_camera(args.camera, args.width, args.height, args.fps)
 
     # The camera may not honor the requested size; use what we actually get.

@@ -40,6 +40,14 @@ pyinstaller --noconfirm vcam.spec      # -> dist/vcam.exe
 `dist/vcam.exe` bundles Python, the RVM model, and all dependencies — copy it to
 any **Windows 10/11 (64-bit)** PC and double-click; no install required.
 
+**Faster startup:** the single-file exe unpacks itself to a temp folder on every
+launch. Build a folder instead and it starts much faster — ship (or zip) the
+whole `dist/vcam/` folder and run `vcam.exe` inside it:
+
+```bash
+pyinstaller --noconfirm vcam.spec -- --onedir   # -> dist/vcam/vcam.exe + _internal/
+```
+
 Two caveats for "any computer":
 - It's a **Windows x64** binary (build separately for macOS/Linux).
 - The **virtual-camera output needs the OBS Virtual Camera** driver on the target

@@ -13,7 +13,9 @@ Then in Google Meet:  Settings -> Video -> Camera -> "OBS Virtual Camera".
 """
 from __future__ import annotations
 
+import json
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -29,11 +31,25 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 import vcam
 
 PREVIEW_W = 480
+
+# Background gallery (under the preview): a Browse tile + one thumbnail per image
+# in the chosen folder. 4 columns of 16:9 tiles fill the preview's width; the
+# canvas shows 2 rows and scrolls for the rest.
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+GAL_COLS = 4
+THUMB_W, THUMB_H = 108, 61
+TILE_BORDER = 3                       # selection highlight width (px)
+TILE_PAD = 3
+GAL_ROWS_VISIBLE = 2
+SELECTED_COLOR = "#1a73e8"
+
+# Remembers the gallery folder and chosen image between launches.
+SETTINGS_PATH = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "vcam" / "ui_settings.json"
 
 # label -> (capture_w, capture_h, out_w, out_h). "Smooth" captures at a fast
 # low-res the webcam can deliver at 30 fps, then upscales the matted output.
@@ -88,13 +104,29 @@ class VCamUI:
         self._preview_imgtk = None
         self._busy = False
 
-        # Default to the user's image background if one sits next to the app.
-        default_img = vcam.HERE / "2.png"
-        self.bg_path = str(default_img) if default_img.is_file() else None
+        # Gallery state: tiles keyed by image path, filled in by a background
+        # thumbnail thread via _thumb_q. _gal_gen invalidates a stale load when
+        # another folder is browsed mid-way.
+        self._tiles: dict[str, tk.Label] = {}
+        self._thumb_q: queue.Queue = queue.Queue()
+        self._gal_gen = 0
+
+        # Restore the last gallery folder / image; else fall back to the user's
+        # image background if one sits next to the app.
+        settings = self._load_settings()
+        self.gal_folder = settings.get("folder")
+        if self.gal_folder and not Path(self.gal_folder).is_dir():
+            self.gal_folder = None
+        self.bg_path = settings.get("image")
+        if not (self.bg_path and Path(self.bg_path).is_file()):
+            default_img = vcam.HERE / "2.png"
+            self.bg_path = str(default_img) if default_img.is_file() else None
 
         self._build()
         self._refresh_vc_status()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.gal_folder:
+            self._load_folder(self.gal_folder)
         self._tick()
 
     # ------------------------------------------------------------------ UI --
@@ -131,19 +163,9 @@ class VCamUI:
         cam_spin.bind("<FocusOut>", lambda _e: self._apply_camera())
 
         # Background
+        # (The background image itself is picked in the gallery under the preview.)
         bgf = ttk.LabelFrame(left, text="3. Background")
         bgf.grid(row=2, column=0, sticky="ew", **pad)
-        self.mode = tk.StringVar(value="image" if self.bg_path else "blur")
-        ttk.Radiobutton(bgf, text="Blur", value="blur", variable=self.mode,
-                        command=self._apply_bg).grid(row=0, column=0, sticky="w", **pad)
-        ttk.Radiobutton(bgf, text="Image", value="image", variable=self.mode,
-                        command=self._apply_bg).grid(row=0, column=1, sticky="w", **pad)
-        ttk.Radiobutton(bgf, text="Green screen", value="color", variable=self.mode,
-                        command=self._apply_bg).grid(row=0, column=2, sticky="w", **pad)
-        ttk.Button(bgf, text="Choose image…", command=self._choose_image).grid(
-            row=1, column=0, sticky="ew", **pad)
-        self.img_label = ttk.Label(bgf, text=self._img_name(), foreground="#555")
-        self.img_label.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
         self.blur_image = tk.BooleanVar(value=False)
         ttk.Checkbutton(bgf, text="Blur image (soft, out-of-focus background)",
                         variable=self.blur_image, command=self._apply_bg).grid(
@@ -196,22 +218,57 @@ class VCamUI:
                   foreground="#888", wraplength=320, justify="left").grid(
             row=5, column=0, columnspan=3, sticky="w", **pad)
 
-        # Right column: preview --------------------------------------------
-        right = ttk.LabelFrame(self.root, text="Preview")
-        right.grid(row=0, column=1, sticky="n", **pad)
+        # Right column: preview + background gallery -----------------------
+        right_col = ttk.Frame(self.root)
+        right_col.grid(row=0, column=1, sticky="n")
+        right = ttk.LabelFrame(right_col, text="Preview")
+        right.grid(row=0, column=0, sticky="ew", **pad)
         self.preview = ttk.Label(right, text="(camera off)", anchor="center",
                                  width=40, background="#222", foreground="#aaa")
         self.preview.grid(row=0, column=0, padx=6, pady=6)
         self.fps_label = ttk.Label(right, text="", wraplength=PREVIEW_W, justify="left")
         self.fps_label.grid(row=1, column=0, sticky="w", padx=6)
 
+        self.gal_frame = ttk.LabelFrame(right_col, text=self._gallery_title())
+        self.gal_frame.grid(row=1, column=0, sticky="ew", **pad)
+        tile_w = THUMB_W + 2 * (TILE_BORDER + TILE_PAD)
+        tile_h = THUMB_H + 2 * (TILE_BORDER + TILE_PAD)
+        self.gal_canvas = tk.Canvas(self.gal_frame, width=GAL_COLS * tile_w,
+                                    height=GAL_ROWS_VISIBLE * tile_h,
+                                    highlightthickness=0, yscrollincrement=tile_h)
+        gal_scroll = ttk.Scrollbar(self.gal_frame, orient="vertical",
+                                   command=self.gal_canvas.yview)
+        self.gal_canvas.configure(yscrollcommand=gal_scroll.set)
+        self.gal_canvas.grid(row=0, column=0, padx=(6, 0), pady=6)
+        gal_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 6), pady=6)
+        self._gal_inner = tk.Frame(self.gal_canvas)
+        self._tile_bg = self._gal_inner.cget("bg")
+        self.gal_canvas.create_window((0, 0), window=self._gal_inner, anchor="nw")
+        self._gal_inner.bind("<Configure>", lambda _e: self.gal_canvas.configure(
+            scrollregion=self.gal_canvas.bbox("all")))
+        # Mouse wheel scrolls the gallery only while the pointer is over it.
+        self.gal_canvas.bind("<Enter>", lambda _e: self.gal_canvas.bind_all(
+            "<MouseWheel>", self._on_gallery_wheel))
+        self.gal_canvas.bind("<Leave>", lambda _e: self.gal_canvas.unbind_all("<MouseWheel>"))
+
+        # Slot 0: the Browse tile (same size as an image tile).
+        browse_cell = ttk.Frame(self._gal_inner, width=THUMB_W + 2 * TILE_BORDER,
+                                height=THUMB_H + 2 * TILE_BORDER)
+        browse_cell.grid_propagate(False)
+        browse_cell.columnconfigure(0, weight=1)
+        browse_cell.rowconfigure(0, weight=1)
+        browse_cell.grid(row=0, column=0, padx=TILE_PAD, pady=TILE_PAD)
+        ttk.Button(browse_cell, text="📁  Browse…", command=self._browse_folder).grid(
+            row=0, column=0, sticky="nsew")
+
         ttk.Label(self.root,
                   text="In Google Meet: Settings ▸ Video ▸ Camera ▸ \"OBS Virtual Camera\"",
                   foreground="#444").grid(row=1, column=0, columnspan=2, sticky="w", **pad)
 
     # -------------------------------------------------------------- actions --
-    def _img_name(self):
-        return Path(self.bg_path).name if self.bg_path else "(none)"
+    def _mode(self):
+        # An image background once one is picked; live blur of the real room until then.
+        return "image" if self.bg_path else "blur"
 
     def _install(self):
         self._vcam_action(vcam.install_virtualcam, "Install")
@@ -268,12 +325,9 @@ class VCamUI:
             self.toggle_btn.config(text="Turn ON")
             self.worker.stop()
             return
-        mode = self.mode.get()
-        if mode == "image" and not self.bg_path and not self._choose_image():
-            return
         cw, ch, ow, oh = SPEED_MODES[self.quality.get()]
         self.worker.configure(
-            camera=self.cam_idx.get(), engine=self.engine.get(), mode=mode,
+            camera=self.cam_idx.get(), engine=self.engine.get(), mode=self._mode(),
             bg_path=self.bg_path, blur_image=self.blur_image.get(),
             blur_strength=self.blur_strength.get(),
             mirror=self.mirror.get(), multi_person=not self.one_person.get(),
@@ -284,11 +338,8 @@ class VCamUI:
         self.worker.start()
 
     def _apply_bg(self):
-        mode = self.mode.get()
-        if mode == "image" and not self.bg_path and not self._choose_image():
-            self.mode.set("blur")
-            mode = "blur"
-        self.worker.set_background(mode, path=self.bg_path, blur_image=self.blur_image.get())
+        self.worker.set_background(self._mode(), path=self.bg_path,
+                                   blur_image=self.blur_image.get())
 
     def _on_blur_scale(self, value):
         # Live: rebuilds the compositor with the new sigma (Blur mode and/or
@@ -324,28 +375,146 @@ class VCamUI:
         except (tk.TclError, ValueError):
             pass   # mid-typing / empty spinbox; ignore until a valid value
 
-    def _choose_image(self) -> bool:
-        path = filedialog.askopenfilename(
-            title="Choose a background image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
-        if not path:
-            return False
+    # -------------------------------------------------------------- gallery --
+    def _gallery_title(self):
+        name = Path(self.gal_folder).name if self.gal_folder else ""
+        return f"Background images — {name}" if name else "Background images"
+
+    def _browse_folder(self):
+        folder = filedialog.askdirectory(title="Choose a folder of background images",
+                                         initialdir=self.gal_folder or str(Path.home()))
+        if not folder:
+            return
+        self.gal_folder = str(Path(folder))
+        self.gal_frame.config(text=self._gallery_title())
+        self._save_settings()
+        self._load_folder(self.gal_folder)
+
+    def _load_folder(self, folder):
+        """Clear the gallery and thumbnail `folder`'s images on a background
+        thread (big photos take a while to decode; the UI stays responsive).
+        Tiles appear as they're ready, via _drain_thumbs() in the main loop."""
+        self._gal_gen += 1
+        for tile in self._tiles.values():
+            tile.destroy()
+        self._tiles.clear()
+        self.gal_canvas.yview_moveto(0)
+        if not folder:
+            return                              # just cleared the gallery
+        try:
+            files = sorted((p for p in Path(folder).iterdir()
+                            if p.suffix.lower() in IMAGE_EXTS and p.is_file()),
+                           key=lambda p: p.name.lower())
+        except OSError:
+            files = []
+        threading.Thread(target=self._thumb_worker, args=(self._gal_gen, files),
+                         daemon=True).start()
+
+    def _thumb_worker(self, gen, files):
+        for p in files:
+            if gen != self._gal_gen:
+                return                          # another folder was browsed; abandon
+            try:
+                with Image.open(p) as im:
+                    im.draft("RGB", (THUMB_W * 2, THUMB_H * 2))   # fast JPEG downscale
+                    im = ImageOps.exif_transpose(im).convert("RGB")
+                    thumb = ImageOps.fit(im, (THUMB_W, THUMB_H), Image.LANCZOS)
+            except Exception:  # noqa: BLE001  (unreadable/corrupt image: skip it)
+                continue
+            self._thumb_q.put((gen, str(p), thumb))
+
+    def _drain_thumbs(self):
+        """Turn finished thumbnails into tiles (Tk objects: main thread only)."""
+        while True:
+            try:
+                gen, path, thumb = self._thumb_q.get_nowait()
+            except queue.Empty:
+                return
+            if gen == self._gal_gen:
+                self._add_tile(path, thumb)
+
+    def _add_tile(self, path, thumb):
+        slot = len(self._tiles) + 1            # slot 0 is the Browse tile
+        imgtk = ImageTk.PhotoImage(thumb)
+        tile = tk.Label(self._gal_inner, image=imgtk, borderwidth=0, cursor="hand2",
+                        highlightthickness=TILE_BORDER,
+                        highlightbackground=self._tile_color(path))
+        tile.image = imgtk                     # keep a reference (Tk won't)
+        tile.grid(row=slot // GAL_COLS, column=slot % GAL_COLS, padx=TILE_PAD, pady=TILE_PAD)
+        tile.bind("<Button-1>", lambda _e, p=path: self._select_image(p))
+        self._tiles[path] = tile
+
+    def _tile_color(self, path):
+        return SELECTED_COLOR if self._same_path(path, self.bg_path) else self._tile_bg
+
+    @staticmethod
+    def _same_path(a, b):
+        return bool(a and b) and os.path.normcase(os.path.abspath(a)) == \
+            os.path.normcase(os.path.abspath(b))
+
+    def _select_image(self, path):
+        # Tiles are thumbnailed once; the folder may since have been moved,
+        # renamed or deleted. Don't hand the worker a dead path (it would
+        # silently keep the live blur) — rescan, or ask for the folder again.
+        if not Path(path).is_file():
+            if self.gal_folder and Path(self.gal_folder).is_dir():
+                messagebox.showwarning(
+                    "Background image",
+                    f"\"{Path(path).name}\" is no longer in this folder.\n\n"
+                    "The gallery has been refreshed.")
+                self._load_folder(self.gal_folder)
+            else:
+                messagebox.showwarning(
+                    "Background image",
+                    f"The folder \"{self.gal_folder}\" was moved or deleted.\n\n"
+                    "Click Browse… to choose it again.")
+                self.gal_folder = None
+                self.gal_frame.config(text=self._gallery_title())
+                self._load_folder(None)
+                self._save_settings()
+            return
         self.bg_path = path
-        self.img_label.config(text=self._img_name())
-        self.mode.set("image")
+        for p, tile in self._tiles.items():
+            tile.config(highlightbackground=self._tile_color(p))
         self.worker.set_background("image", path=path, blur_image=self.blur_image.get())
-        return True
+        self._save_settings()
+
+    def _on_gallery_wheel(self, event):
+        # Only scroll when there's more than fits (Tk would otherwise let it drift).
+        if self._gal_inner.winfo_height() > self.gal_canvas.winfo_height():
+            self.gal_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    # ------------------------------------------------------------- settings --
+    @staticmethod
+    def _load_settings():
+        try:
+            return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_settings(self):
+        try:
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_PATH.write_text(json.dumps({"folder": self.gal_folder,
+                                                 "image": self.bg_path}, indent=2),
+                                     encoding="utf-8")
+        except OSError:
+            pass                                # not critical; just won't be remembered
 
     # ----------------------------------------------------------- main loop --
     def _tick(self):
+        self._drain_thumbs()
         st = self.worker.status
         if self.worker.running and st == "running":
             self.run_status.config(text="● Running", foreground="green")
             self.toggle_btn.config(text="Turn OFF")
             prov = PROVIDER_SHORT.get(self.worker.provider, self.worker.provider or "")
-            note = f"\n{self.worker.device_note}" if self.worker.device_note else ""
-            self.fps_label.config(
-                text=f"{self.worker.fps:.0f} fps · {prov} · {self.worker.device or ''}{note}")
+            text = f"{self.worker.fps:.0f} fps · {prov} · {self.worker.device or ''}"
+            if self.worker.device_note:
+                text += f"\n{self.worker.device_note}"
+            if self.worker.bg_warning:
+                text += f"\n⚠ {self.worker.bg_warning} (using blur)"
+            self.fps_label.config(text=text)
         elif st == "starting":
             self.run_status.config(text="Starting…", foreground="#a60")
             self.toggle_btn.config(text="Turn OFF")
@@ -358,7 +527,8 @@ class VCamUI:
             self.toggle_btn.config(text="Turn ON")
             self.fps_label.config(text="")
 
-        frame = self.worker.latest_frame()
+        # No point drawing the preview while minimized; the camera keeps running.
+        frame = None if self.root.state() == "iconic" else self.worker.latest_frame()
         if frame is not None:
             h, w = frame.shape[:2]
             disp = cv2.resize(frame, (PREVIEW_W, int(h * PREVIEW_W / w)))
@@ -395,9 +565,10 @@ def _selftest() -> int:
     import numpy as np
     lines, ok = [], True
     try:
-        eng = vcam.RvmEngine(640, 480)
+        eng = vcam.RvmEngine(640, 480, device="auto")
         a, fg = eng.process((np.random.rand(480, 640, 3) * 255).astype("uint8"))
-        lines.append(f"RVM OK: alpha{a.shape} fg{fg.shape} dsr={eng.dsr} threads={eng.threads}")
+        lines.append(f"RVM OK: alpha{a.shape} fg{fg.shape} dsr={eng.dsr} "
+                     f"provider={eng.provider} note={eng.note!r}")
     except Exception as exc:  # noqa: BLE001
         ok = False
         lines.append(f"RVM FAIL: {exc!r}")
@@ -433,6 +604,8 @@ def _set_window_icon(root):
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    # Keep matting at full speed when the window is minimized or covered.
+    vcam.disable_power_throttling()
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.2)

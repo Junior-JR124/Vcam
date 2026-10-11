@@ -1,11 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for a single-file vcam.exe (the GUI control panel).
+"""PyInstaller spec for vcam.exe (the GUI control panel).
 
-Build:  pyinstaller --noconfirm vcam.spec
-Output: dist/vcam.exe
+Single file (default) -- one portable exe, but it unpacks itself to a temp dir
+on every launch, so startup is slow:
+    pyinstaller --noconfirm vcam.spec                -> dist/vcam.exe
+
+Folder (--onedir) -- nothing to unpack, so it starts much faster; ship/zip the
+whole dist/vcam/ folder (vcam.exe + _internal/):
+    pyinstaller --noconfirm vcam.spec -- --onedir    -> dist/vcam/vcam.exe
 """
+import argparse
 import os
 from PyInstaller.utils.hooks import collect_all
+
+# Options after `--` on the pyinstaller command line reach the spec (PyInstaller 6+).
+_opts = argparse.ArgumentParser()
+_opts.add_argument("--onedir", action="store_true", help="build a folder instead of one exe")
+ONEDIR = _opts.parse_args().onedir
 
 datas = [
     ("models/rvm_mobilenetv3_fp32.onnx", "models"),        # bundle the RVM model
@@ -53,9 +64,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    *([] if ONEDIR else [a.binaries, a.datas]),   # onedir: COLLECT copies these
     [],
+    exclude_binaries=ONEDIR,
     name="vcam",
     debug=False,
     bootloader_ignore_signals=False,
@@ -66,3 +77,13 @@ exe = EXE(
     disable_windowed_traceback=False,
     icon="assets/icon.ico",
 )
+
+if ONEDIR:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="vcam",        # -> dist/vcam/
+    )
